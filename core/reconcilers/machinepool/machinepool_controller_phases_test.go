@@ -1762,6 +1762,82 @@ func TestReconcileMachinePoolMachines(t *testing.T) {
 			g.Expect(env.GetAPIReader().List(ctx, machineList, client.InNamespace(cluster.Namespace), client.MatchingLabels(labels))).To(Succeed())
 			g.Expect(machineList.Items).To(BeEmpty())
 		})
+
+		t.Run("Should propagate deletion timeouts to new and existing machines", func(*testing.T) {
+			machinePool := getMachinePool(2, "machinepool-test-4", clusterName, ns.Name)
+			machinePool.Spec.Template.Spec.Deletion = clusterv1.MachineDeletionSpec{
+				NodeDrainTimeoutSeconds:        ptr.To[int32](30),
+				NodeVolumeDetachTimeoutSeconds: ptr.To[int32](40),
+				NodeDeletionTimeoutSeconds:     ptr.To[int32](50),
+			}
+			g.Expect(env.CreateAndWait(ctx, &machinePool)).To(Succeed())
+
+			infraMachines := getInfraMachines(2, machinePool.Name, clusterName, ns.Name)
+			for i := range infraMachines {
+				g.Expect(env.CreateAndWait(ctx, &infraMachines[i])).To(Succeed())
+			}
+
+			infraConfig := map[string]interface{}{
+				"kind":       builder.GenericInfrastructureMachinePoolKind,
+				"apiVersion": clusterv1.GroupVersionInfrastructure.String(),
+				"metadata": map[string]interface{}{
+					"name":      "infra-config4",
+					"namespace": ns.Name,
+				},
+				"spec": map[string]interface{}{
+					"providerIDList": []interface{}{
+						"test://id-1",
+					},
+				},
+				"status": map[string]interface{}{
+					"initialization":            map[string]interface{}{"provisioned": true},
+					"infrastructureMachineKind": builder.GenericInfrastructureMachineKind,
+				},
+			}
+			g.Expect(env.CreateAndWait(ctx, &unstructured.Unstructured{Object: infraConfig})).To(Succeed())
+
+			r := &Reconciler{
+				Client:       env,
+				DynamicCache: dynamicCache,
+				ssaCache:     ssa.NewCache(testController),
+				externalTracker: external.ObjectTracker{
+					Controller:      externalfake.Controller{},
+					Cache:           &informertest.FakeInformers{},
+					Scheme:          env.Scheme(),
+					PredicateLogger: ptr.To(logr.New(log.NullLogSink{})),
+				},
+				controller: externalfake.Controller{},
+			}
+
+			scope := &scope{
+				machinePool: &machinePool,
+			}
+
+			labels := map[string]string{
+				clusterv1.ClusterNameLabel:     clusterName,
+				clusterv1.MachinePoolNameLabel: machinePool.Name,
+			}
+			reconcileAndExpectDeletion := func(want clusterv1.MachineDeletionSpec) {
+				g.Expect(r.reconcileMachines(ctx, scope, &unstructured.Unstructured{Object: infraConfig})).To(Succeed())
+				r.reconcilePhase(&machinePool)
+
+				machineList := &clusterv1.MachineList{}
+				g.Expect(env.GetAPIReader().List(ctx, machineList, client.InNamespace(cluster.Namespace), client.MatchingLabels(labels))).To(Succeed())
+				g.Expect(machineList.Items).To(HaveLen(2))
+				for _, machine := range machineList.Items {
+					g.Expect(machine.Spec.Deletion).To(Equal(want))
+				}
+			}
+
+			reconcileAndExpectDeletion(machinePool.Spec.Template.Spec.Deletion)
+
+			// A field cleared from the template must be pruned from existing Machines.
+			machinePool.Spec.Template.Spec.Deletion = clusterv1.MachineDeletionSpec{
+				NodeDrainTimeoutSeconds:    ptr.To[int32](60),
+				NodeDeletionTimeoutSeconds: ptr.To[int32](50),
+			}
+			reconcileAndExpectDeletion(machinePool.Spec.Template.Spec.Deletion)
+		})
 	})
 }
 

@@ -600,6 +600,7 @@ func (r *Reconciler) computeDesiredMachine(mp *clusterv1.MachinePool, infraMachi
 			},
 			InfrastructureRef: infraRef,
 			Version:           kubernetesVersion,
+			Deletion:          mp.Spec.Template.Spec.Deletion,
 		},
 	}
 
